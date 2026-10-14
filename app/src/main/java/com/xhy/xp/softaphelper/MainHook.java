@@ -67,6 +67,12 @@ public class MainHook implements IXposedHookLoadPackage {
 
     public static final int BAND_5GHZ = 1 << 1;
     public static final int CHANNEL_WIDTH_320MHZ = 11;
+    private static final int ANDROID_16_API_LEVEL = 36;
+    private static final int ANDROID_14_API_LEVEL = 34;
+    private static final int ANDROID_16_SOFT_AP_CONSTRUCTOR_PARAMETER_COUNT = 27;
+    private static final int SOFT_AP_CHANNELS_ARGUMENT_INDEX = 4;
+    private static final int SOFT_AP_ALLOWED_ACS_5G_ARGUMENT_INDEX = 21;
+    private static final int SOFT_AP_MAX_BANDWIDTH_ARGUMENT_INDEX = 23;
     // channel: 149,153,157,161,165
     // freq:    5745,5765,5785,5805,5825
     private static HashSet<Integer> AvailableChannelSet_LOW = new HashSet<>(Arrays.asList(36, 40, 44));
@@ -81,11 +87,123 @@ public class MainHook implements IXposedHookLoadPackage {
         AddressMap.put(TETHERING_ETHERNET, ETHERNET_HOST_IFACE_ADDRESS);
     }
 
+    private static void logA16(String message) {
+        XposedBridge.log("[" + TAG + "] [A16] " + message);
+    }
+
+    private static String formatMethodSignature(Method method) {
+        StringBuilder signature = new StringBuilder(method.getName()).append("(");
+        Class<?>[] parameterTypes = method.getParameterTypes();
+        for (int i = 0; i < parameterTypes.length; i++) {
+            if (i > 0) {
+                signature.append(", ");
+            }
+            signature.append(parameterTypes[i].getSimpleName());
+        }
+        return signature.append(") -> ").append(method.getReturnType().getSimpleName()).toString();
+    }
+
+    private static String getMethodCandidates(Class<?> klass, String methodName) {
+        StringBuilder candidates = new StringBuilder();
+        for (Method candidate : klass.getDeclaredMethods()) {
+            if (!candidate.getName().equals(methodName)) {
+                continue;
+            }
+            if (candidates.length() > 0) {
+                candidates.append("; ");
+            }
+            candidates.append(formatMethodSignature(candidate));
+        }
+        return candidates.length() == 0 ? "<none>" : candidates.toString();
+    }
+
+    private static Method findDeclaredMethod(Class<?> klass, String methodName,
+                                             Class<?>... parameterTypes) {
+        try {
+            Method method = klass.getDeclaredMethod(methodName, parameterTypes);
+            method.setAccessible(true);
+            return method;
+        } catch (NoSuchMethodException exception) {
+            logA16("methodMissing class=" + klass.getName() + " method=" + methodName
+                    + " candidates=" + getMethodCandidates(klass, methodName));
+            return null;
+        }
+    }
+
+    private static Method findRequestIpv4AddressMethod(Class<?> klass) {
+        if (Build.VERSION.SDK_INT >= ANDROID_14_API_LEVEL) {
+            return findDeclaredMethod(klass, methodName_R, int.class, boolean.class);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return findDeclaredMethod(klass, methodName_R, boolean.class);
+        }
+        return findDeclaredMethod(klass, methodName_R);
+    }
+
+    private static String formatConstructorSignature(Constructor<?> ctor) {
+        StringBuilder signature = new StringBuilder("SoftApConfiguration(");
+        Class<?>[] parameterTypes = ctor.getParameterTypes();
+        for (int i = 0; i < parameterTypes.length; i++) {
+            if (i > 0) {
+                signature.append(", ");
+            }
+            signature.append(parameterTypes[i].getSimpleName());
+        }
+        return signature.append(")").toString();
+    }
+
+    private static boolean hasSoftApArgumentLayout(Constructor<?> ctor) {
+        Class<?>[] parameterTypes = ctor.getParameterTypes();
+        return parameterTypes.length > SOFT_AP_MAX_BANDWIDTH_ARGUMENT_INDEX
+                && SparseIntArray.class.isAssignableFrom(
+                parameterTypes[SOFT_AP_CHANNELS_ARGUMENT_INDEX])
+                && Set.class.isAssignableFrom(
+                parameterTypes[SOFT_AP_ALLOWED_ACS_5G_ARGUMENT_INDEX])
+                && parameterTypes[SOFT_AP_MAX_BANDWIDTH_ARGUMENT_INDEX] == int.class;
+    }
+
+    /**
+     * Android represents an automatic dual-band configuration with a composite key such as
+     * BAND_2GHZ | BAND_5GHZ (3), rather than a separate BAND_5GHZ key. Treat every key which
+     * contains the 5 GHz bit as a 5 GHz configuration.
+     */
+    private static int find5GhzChannelKey(SparseIntArray channels) {
+        for (int index = 0; index < channels.size(); index++) {
+            int bandKey = channels.keyAt(index);
+            if ((bandKey & BAND_5GHZ) != 0) {
+                return bandKey;
+            }
+        }
+        return -1;
+    }
+
+    private static String tetheringTypeToString(int interfaceType) {
+        switch (interfaceType) {
+            case TETHERING_WIFI:
+                return "WIFI";
+            case TETHERING_USB:
+                return "USB";
+            case TETHERING_BLUETOOTH:
+                return "BLUETOOTH";
+            case TETHERING_WIFI_P2P:
+                return "WIFI_P2P";
+            case TETHERING_NCM:
+                return "NCM";
+            case TETHERING_ETHERNET:
+                return "ETHERNET";
+            case TETHERING_WIGIG:
+                return "WIGIG";
+            default:
+                return "UNKNOWN";
+        }
+    }
+
     private boolean isConflictPrefix(Class<?> klass, Object thiz, IpPrefix prefix) throws Exception {
         Field field_mPrivateAddressCoordinator = ReflectUtils.findField(klass, "mPrivateAddressCoordinator");
         // Android 15+, bypass
         if(field_mPrivateAddressCoordinator == null){
-            XposedBridge.log("[" + TAG + "] [Warning]: [" + WIFI_HOST_IFACE_ADDR + "] field_mPrivateAddressCoordinator not found.");
+            logA16("IpServer conflictGuardUnavailable field=mPrivateAddressCoordinator"
+                    + " requestedPrefix=" + prefix);
             return false;
         }
         Object mPrivateAddressCoordinator = field_mPrivateAddressCoordinator.get(thiz);
@@ -140,12 +258,14 @@ public class MainHook implements IXposedHookLoadPackage {
                 Constructor<?> ctor_IpPrefix = IpPrefix.class.getDeclaredConstructor(String.class);
 
                 Class<?> klass = classLoader.loadClass(className);
-                Method method = ReflectUtils.findMethod(klass, methodName);
+                Method method = findRequestIpv4AddressMethod(klass);
                 if (method == null) {
-                    XposedBridge.log("[" + TAG + "] [Error]: [" + methodName + "] not found in class " + klass.getName());
                     return;
                 } else {
-                    XposedBridge.log("[" + TAG + "] [Success]: [" + methodName + "] found in " + lpparam.processName);
+                    logA16("IpServer hookReady package=" + lpparam.packageName
+                            + " process=" + lpparam.processName
+                            + " classLoader=" + classLoader
+                            + " method=" + formatMethodSignature(method));
                 }
 
                 XposedBridge.hookMethod(method,
@@ -166,22 +286,30 @@ public class MainHook implements IXposedHookLoadPackage {
                                 }
 
                                 String address = AddressMap.get(mInterfaceType);
+                                if (address == null) {
+                                    logA16("IpServer addressOverrideSkipped interfaceType=" + mInterfaceType
+                                            + "(" + tetheringTypeToString(mInterfaceType) + ") reason=noMappedAddress");
+                                    return;
+                                }
 
                                 final LinkAddress mLinkAddress = (LinkAddress) ctor_LinkAddress.newInstance(address);
                                 final IpPrefix prefix = (IpPrefix) ctor_IpPrefix.newInstance(address);
 
-                                if (address != null && StackUtils.isCallingFrom(className, callerMethodName_Q)) {
+                                if (StackUtils.isCallingFrom(className, callerMethodName_Q)) {
                                     if (isConflictPrefix(klass, param.thisObject, prefix)) {
                                         XposedBridge.log("[" + TAG + "] [Warning]: [" + WIFI_HOST_IFACE_ADDR + "] isConflictPrefix! do not replace.");
                                     } else {
-                                        XposedBridge.log("[" + TAG + "] [Success Edit]:" + address);
+                                        logA16("IpServer addressOverride interfaceType=" + mInterfaceType
+                                                + "(" + tetheringTypeToString(mInterfaceType) + ")"
+                                                + " address=" + address + " caller=" + callerMethodName_Q);
                                         param.setResult(mLinkAddress);
                                     }
                                 }
                             }
                         });
             } catch (Exception exception) {
-//                XposedBridge.log("[" + TAG + "] exception in " + lpparam.packageName + ": " + exception);
+                logA16("IpServer hookFailed package=" + lpparam.packageName
+                        + " process=" + lpparam.processName + " error=" + exception);
             }
         }
 
@@ -199,6 +327,20 @@ public class MainHook implements IXposedHookLoadPackage {
         else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S_V2) {
             try {
                 for (Constructor<?> ctor : SoftApConfiguration.class.getDeclaredConstructors()) {
+                    final boolean hasExpectedArgumentLayout = hasSoftApArgumentLayout(ctor);
+                    final boolean isAndroid16ExpectedConstructor = Build.VERSION.SDK_INT < ANDROID_16_API_LEVEL
+                            || ctor.getParameterTypes().length
+                            == ANDROID_16_SOFT_AP_CONSTRUCTOR_PARAMETER_COUNT;
+                    logA16("SoftAp constructor package=" + lpparam.packageName
+                            + " process=" + lpparam.processName
+                            + " parameterCount=" + ctor.getParameterTypes().length
+                            + " expectedLayout=" + hasExpectedArgumentLayout
+                            + " signature=" + formatConstructorSignature(ctor));
+                    if (!hasExpectedArgumentLayout || !isAndroid16ExpectedConstructor) {
+                        logA16("SoftAp constructorSkipped reason=unexpectedLayout"
+                                + " android16=" + (Build.VERSION.SDK_INT >= ANDROID_16_API_LEVEL));
+                        continue;
+                    }
                     XposedBridge.hookMethod(ctor,
                             new XC_MethodHook() {
                                 @Override
@@ -210,26 +352,39 @@ public class MainHook implements IXposedHookLoadPackage {
                                         param.args[1] = MacAddress.fromString("aa:bb:cc:dd:ee:ff");
                                     }
 
-                                    SparseIntArray channels = (SparseIntArray) param.args[4];
-                                    int channel5gIndex = channels.indexOfKey(BAND_5GHZ);
+                                    if (!(param.args[SOFT_AP_CHANNELS_ARGUMENT_INDEX] instanceof SparseIntArray)
+                                            || !(param.args[SOFT_AP_ALLOWED_ACS_5G_ARGUMENT_INDEX] instanceof Set)
+                                            || !(param.args[SOFT_AP_MAX_BANDWIDTH_ARGUMENT_INDEX] instanceof Integer)) {
+                                        logA16("SoftAp mutationSkipped reason=runtimeArgumentTypeMismatch"
+                                                + " parameterCount=" + param.args.length);
+                                        return;
+                                    }
 
-                                    Set<Integer> allowedAcsChannels5g = (Set<Integer>) param.args[21];
-//                                    int maxChannelBandwidth = (int) param.args[23];
-//                                    XposedBridge.log("["+TAG+"] orig channel5gIndex " + channel5gIndex);
-//                                    XposedBridge.log("["+TAG+"] orig channels " + channels);
-//                                    XposedBridge.log("["+TAG+"] orig allowedAcsChannels5g " + allowedAcsChannels5g);
-//                                    XposedBridge.log("["+TAG+"] orig maxChannelBandwidth " + maxChannelBandwidth);
+                                    SparseIntArray channels = (SparseIntArray) param.args[SOFT_AP_CHANNELS_ARGUMENT_INDEX];
+                                    int channel5gKey = find5GhzChannelKey(channels);
+
+                                    Set<Integer> allowedAcsChannels5g =
+                                            (Set<Integer>) param.args[SOFT_AP_ALLOWED_ACS_5G_ARGUMENT_INDEX];
+                                    int maxChannelBandwidth =
+                                            (int) param.args[SOFT_AP_MAX_BANDWIDTH_ARGUMENT_INDEX];
+                                    logA16("SoftAp configObserved channels=" + channels
+                                            + " channel5gKey=" + channel5gKey
+                                            + " allowedAcs5g=" + allowedAcsChannels5g
+                                            + " maxBandwidth=" + maxChannelBandwidth);
 
                                     // config has set 5G channel
-                                    if (channel5gIndex >= 0) {
-                                        int channel = channels.get(BAND_5GHZ);
+                                    if (channel5gKey >= 0) {
+                                        int channel = channels.get(channel5gKey);
 
                                         // 5GHz + allowedAcsChannels5g.size == 0
                                         if (channel == 0 && allowedAcsChannels5g.size() == 0) {
                                             // 5G ACS channels
-                                            param.args[21] = AvailableChannelSet_HIGH;
+                                            param.args[SOFT_AP_ALLOWED_ACS_5G_ARGUMENT_INDEX] = AvailableChannelSet_HIGH;
                                             // max bandwidth
-                                            param.args[23] = CHANNEL_WIDTH_320MHZ;
+                                            param.args[SOFT_AP_MAX_BANDWIDTH_ARGUMENT_INDEX] = CHANNEL_WIDTH_320MHZ;
+                                            logA16("SoftAp configOverride allowedAcs5g="
+                                                    + AvailableChannelSet_HIGH
+                                                    + " maxBandwidth=" + CHANNEL_WIDTH_320MHZ);
                                         }
                                     }
                                 }
@@ -238,19 +393,25 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
 
             } catch (Exception exception) {
-                XposedBridge.log("[" + TAG + "] exception in " + lpparam.packageName + ": " + exception);
+                logA16("SoftAp hookFailed package=" + lpparam.packageName
+                        + " process=" + lpparam.processName + " error=" + exception);
             }
         }
 
         //隐藏热点类型 (Android 10+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
+                logA16("Dhcp probe package=" + lpparam.packageName
+                        + " process=" + lpparam.processName
+                        + " class=android.net.dhcp.DhcpServingParamsParcelExt");
                 Class<?> klass = classLoader.loadClass("android.net.dhcp.DhcpServingParamsParcelExt");
-                Method method = ReflectUtils.findMethod(klass, "setMetered");
+                Method method = findDeclaredMethod(klass, "setMetered", boolean.class);
                 if (method == null) {
-                    XposedBridge.log("[" + TAG + "] [Error]: [" + "setMetered" + "] not found in class " + klass.getName());
+                    return;
                 }else {
-                    XposedBridge.log("[" + TAG + "] [Success]: [" + "setMetered" + "] found in " + lpparam.processName);
+                    logA16("Dhcp hookReady package=" + lpparam.packageName
+                            + " process=" + lpparam.processName
+                            + " method=" + formatMethodSignature(method));
                 }
 
                 XposedBridge.hookMethod(method,
@@ -258,7 +419,9 @@ public class MainHook implements IXposedHookLoadPackage {
                             @Override
                             protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) throws Throwable {
                                 super.beforeHookedMethod(param);
+                                boolean originalMetered = (boolean) param.args[0];
                                 param.args[0] = false;
+                                logA16("Dhcp setMetered original=" + originalMetered + " replacement=false");
                             }
                         });
 
@@ -286,7 +449,8 @@ public class MainHook implements IXposedHookLoadPackage {
 
 
             } catch (Exception exception) {
-//                XposedBridge.log("[" + TAG + "] exception in " + lpparam.packageName + ": " + exception);
+                logA16("Dhcp hookFailed package=" + lpparam.packageName
+                        + " process=" + lpparam.processName + " error=" + exception);
             }
         }
 
