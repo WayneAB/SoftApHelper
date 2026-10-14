@@ -401,12 +401,17 @@ public class MainHook implements IXposedHookLoadPackage {
         //隐藏热点类型 (Android 10+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
+                logA16("Dhcp probe package=" + lpparam.packageName
+                        + " process=" + lpparam.processName
+                        + " class=android.net.dhcp.DhcpServingParamsParcelExt");
                 Class<?> klass = classLoader.loadClass("android.net.dhcp.DhcpServingParamsParcelExt");
-                Method method = ReflectUtils.findMethod(klass, "setMetered");
+                Method method = findDeclaredMethod(klass, "setMetered", boolean.class);
                 if (method == null) {
-                    XposedBridge.log("[" + TAG + "] [Error]: [" + "setMetered" + "] not found in class " + klass.getName());
+                    return;
                 }else {
-                    XposedBridge.log("[" + TAG + "] [Success]: [" + "setMetered" + "] found in " + lpparam.processName);
+                    logA16("Dhcp hookReady package=" + lpparam.packageName
+                            + " process=" + lpparam.processName
+                            + " method=" + formatMethodSignature(method));
                 }
 
                 XposedBridge.hookMethod(method,
@@ -414,7 +419,9 @@ public class MainHook implements IXposedHookLoadPackage {
                             @Override
                             protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) throws Throwable {
                                 super.beforeHookedMethod(param);
+                                boolean originalMetered = (boolean) param.args[0];
                                 param.args[0] = false;
+                                logA16("Dhcp setMetered original=" + originalMetered + " replacement=false");
                             }
                         });
 
@@ -442,7 +449,8 @@ public class MainHook implements IXposedHookLoadPackage {
 
 
             } catch (Exception exception) {
-//                XposedBridge.log("[" + TAG + "] exception in " + lpparam.packageName + ": " + exception);
+                logA16("Dhcp hookFailed package=" + lpparam.packageName
+                        + " process=" + lpparam.processName + " error=" + exception);
             }
         }
 
