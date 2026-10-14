@@ -327,6 +327,20 @@ public class MainHook implements IXposedHookLoadPackage {
         else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S_V2) {
             try {
                 for (Constructor<?> ctor : SoftApConfiguration.class.getDeclaredConstructors()) {
+                    final boolean hasExpectedArgumentLayout = hasSoftApArgumentLayout(ctor);
+                    final boolean isAndroid16ExpectedConstructor = Build.VERSION.SDK_INT < ANDROID_16_API_LEVEL
+                            || ctor.getParameterTypes().length
+                            == ANDROID_16_SOFT_AP_CONSTRUCTOR_PARAMETER_COUNT;
+                    logA16("SoftAp constructor package=" + lpparam.packageName
+                            + " process=" + lpparam.processName
+                            + " parameterCount=" + ctor.getParameterTypes().length
+                            + " expectedLayout=" + hasExpectedArgumentLayout
+                            + " signature=" + formatConstructorSignature(ctor));
+                    if (!hasExpectedArgumentLayout || !isAndroid16ExpectedConstructor) {
+                        logA16("SoftAp constructorSkipped reason=unexpectedLayout"
+                                + " android16=" + (Build.VERSION.SDK_INT >= ANDROID_16_API_LEVEL));
+                        continue;
+                    }
                     XposedBridge.hookMethod(ctor,
                             new XC_MethodHook() {
                                 @Override
@@ -338,26 +352,39 @@ public class MainHook implements IXposedHookLoadPackage {
                                         param.args[1] = MacAddress.fromString("aa:bb:cc:dd:ee:ff");
                                     }
 
-                                    SparseIntArray channels = (SparseIntArray) param.args[4];
-                                    int channel5gIndex = channels.indexOfKey(BAND_5GHZ);
+                                    if (!(param.args[SOFT_AP_CHANNELS_ARGUMENT_INDEX] instanceof SparseIntArray)
+                                            || !(param.args[SOFT_AP_ALLOWED_ACS_5G_ARGUMENT_INDEX] instanceof Set)
+                                            || !(param.args[SOFT_AP_MAX_BANDWIDTH_ARGUMENT_INDEX] instanceof Integer)) {
+                                        logA16("SoftAp mutationSkipped reason=runtimeArgumentTypeMismatch"
+                                                + " parameterCount=" + param.args.length);
+                                        return;
+                                    }
 
-                                    Set<Integer> allowedAcsChannels5g = (Set<Integer>) param.args[21];
-//                                    int maxChannelBandwidth = (int) param.args[23];
-//                                    XposedBridge.log("["+TAG+"] orig channel5gIndex " + channel5gIndex);
-//                                    XposedBridge.log("["+TAG+"] orig channels " + channels);
-//                                    XposedBridge.log("["+TAG+"] orig allowedAcsChannels5g " + allowedAcsChannels5g);
-//                                    XposedBridge.log("["+TAG+"] orig maxChannelBandwidth " + maxChannelBandwidth);
+                                    SparseIntArray channels = (SparseIntArray) param.args[SOFT_AP_CHANNELS_ARGUMENT_INDEX];
+                                    int channel5gKey = find5GhzChannelKey(channels);
+
+                                    Set<Integer> allowedAcsChannels5g =
+                                            (Set<Integer>) param.args[SOFT_AP_ALLOWED_ACS_5G_ARGUMENT_INDEX];
+                                    int maxChannelBandwidth =
+                                            (int) param.args[SOFT_AP_MAX_BANDWIDTH_ARGUMENT_INDEX];
+                                    logA16("SoftAp configObserved channels=" + channels
+                                            + " channel5gKey=" + channel5gKey
+                                            + " allowedAcs5g=" + allowedAcsChannels5g
+                                            + " maxBandwidth=" + maxChannelBandwidth);
 
                                     // config has set 5G channel
-                                    if (channel5gIndex >= 0) {
-                                        int channel = channels.get(BAND_5GHZ);
+                                    if (channel5gKey >= 0) {
+                                        int channel = channels.get(channel5gKey);
 
                                         // 5GHz + allowedAcsChannels5g.size == 0
                                         if (channel == 0 && allowedAcsChannels5g.size() == 0) {
                                             // 5G ACS channels
-                                            param.args[21] = AvailableChannelSet_HIGH;
+                                            param.args[SOFT_AP_ALLOWED_ACS_5G_ARGUMENT_INDEX] = AvailableChannelSet_HIGH;
                                             // max bandwidth
-                                            param.args[23] = CHANNEL_WIDTH_320MHZ;
+                                            param.args[SOFT_AP_MAX_BANDWIDTH_ARGUMENT_INDEX] = CHANNEL_WIDTH_320MHZ;
+                                            logA16("SoftAp configOverride allowedAcs5g="
+                                                    + AvailableChannelSet_HIGH
+                                                    + " maxBandwidth=" + CHANNEL_WIDTH_320MHZ);
                                         }
                                     }
                                 }
@@ -366,7 +393,8 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
 
             } catch (Exception exception) {
-                XposedBridge.log("[" + TAG + "] exception in " + lpparam.packageName + ": " + exception);
+                logA16("SoftAp hookFailed package=" + lpparam.packageName
+                        + " process=" + lpparam.processName + " error=" + exception);
             }
         }
 
