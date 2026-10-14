@@ -11,6 +11,14 @@ SoftAp 5G channel and bandwidth lock for Android 13+
 2. 隐藏热点类型 (Android 10+)
 3. 锁定5G信道和频宽 (Android 13+)
 
+## Android 16 已验证环境
+- 设备：Xiaomi 14 Ultra（`aurora` / `24031PN0DC`）
+- 系统：Android 16 / API 36，HyperOS `3.0.304.0.WNACNXM`
+- Hook 环境：LSPosed `2.2.1 (7912)`，API 102
+- Tethering：`com.android.networkstack.tethering`，版本 16
+
+已完成 Wi-Fi 热点主路径的首轮验证。本轮不包含 USB、蓝牙、P2P、以太网，以及上游使用 `192.168.43.0/24` 时的前缀冲突保护验证。
+
 ## 安卓14已知问题：
 部分安卓14系统由于存在缓存，需要手动**重新优化Tethering**，模块才能生效
 
